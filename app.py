@@ -8,6 +8,7 @@ import random
 import time
 import threading
 import os
+import hashlib
 from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from game_engine import Game, Hero, HEROES, AIPlayer, CardType, CardCategory, GamePhase
@@ -19,10 +20,118 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 rooms: dict[str, Game] = {}
 player_rooms: dict[str, str] = {}
 ai_threads: dict[str, threading.Event] = {}
+ROOM_TTL_SECONDS = int(os.getenv("ROOM_TTL_SECONDS", "1800"))
+cleanup_started = False
 
 
 def generate_room_id():
     return ''.join(random.choices('0123456789', k=6))
+
+
+def now_ts():
+    return time.time()
+
+
+def get_client_fingerprint() -> str:
+    forwarded = request.headers.get('X-Forwarded-For', '')
+    ip = (forwarded.split(',')[0].strip() if forwarded else request.remote_addr) or 'unknown-ip'
+    ua = request.headers.get('User-Agent', 'unknown-ua')
+    return hashlib.md5(f'{ua}|{ip}'.encode('utf-8')).hexdigest()
+
+
+def default_player_name() -> str:
+    return '玩家' + get_client_fingerprint()[:6]
+
+
+def touch_room(game: Game):
+    game.last_active_at = now_ts()
+
+
+def cleanup_expired_rooms():
+    expired = []
+    now = now_ts()
+    for room_id, game in list(rooms.items()):
+        created_at = getattr(game, 'created_at', now)
+        if now - created_at >= ROOM_TTL_SECONDS:
+            expired.append(room_id)
+    for room_id in expired:
+        stop_ai_loop(room_id)
+        rooms.pop(room_id, None)
+        for sid, rid in list(player_rooms.items()):
+            if rid == room_id:
+                player_rooms.pop(sid, None)
+        socketio.emit('room_closed', {'room_id': room_id, 'message': '房间已超过30分钟，自动解散'})
+    if expired:
+        broadcast_room_list()
+
+
+def cleanup_loop():
+    while True:
+        cleanup_expired_rooms()
+        time.sleep(30)
+
+
+def ensure_cleanup_loop():
+    global cleanup_started
+    if not cleanup_started:
+        cleanup_started = True
+        socketio.start_background_task(cleanup_loop)
+
+
+def find_player_by_fingerprint(game: Game, fingerprint: str):
+    for player in game.players:
+        if getattr(player, 'fingerprint', None) == fingerprint:
+            return player
+    return None
+
+
+def bind_player_session(game: Game, player, room_id: str):
+    old_sid = player.player_id
+    if old_sid != request.sid:
+        player.player_id = request.sid
+        player_rooms.pop(old_sid, None)
+    player.fingerprint = get_client_fingerprint()
+    player.is_ai = False
+    if player.name.endswith('(AI)'):
+        player.name = player.name[:-4]
+    player_rooms[request.sid] = room_id
+    touch_room(game)
+
+
+def advance_to_play_phase(room_id: str):
+    if room_id not in rooms:
+        return
+    game = rooms[room_id]
+    current = game.get_current_player()
+    if not current or game.phase == GamePhase.GAME_OVER:
+        return
+    touch_room(game)
+    game.pending_action = None
+    game.phase = GamePhase.JUDGE
+    game.add_log(f'{current.name} 的判定阶段')
+    broadcast_game_state(room_id)
+    time.sleep(0.25)
+    game.phase = GamePhase.DRAW
+    if not current.skip_draw:
+        current.draw_cards(game, 2)
+        game.add_log(f'{current.name} 摸了2张牌')
+    current.skip_draw = False
+    broadcast_game_state(room_id)
+    time.sleep(0.25)
+    if current.skip_play:
+        current.skip_play = False
+        game.phase = GamePhase.DISCARD
+        _handle_discard_phase(game, current)
+        return
+    game.phase = GamePhase.PLAY
+    broadcast_game_state(room_id)
+    if current.is_ai:
+        socketio.start_background_task(run_ai_play_phase, room_id)
+
+
+def schedule_current_turn(room_id: str):
+    if room_id in rooms and rooms[room_id].phase != GamePhase.GAME_OVER:
+        socketio.start_background_task(advance_to_play_phase, room_id)
 
 
 @app.route('/')
@@ -37,6 +146,7 @@ def get_heroes():
 
 @app.route('/api/rooms')
 def get_rooms():
+    cleanup_expired_rooms()
     room_list = []
     for rid, game in rooms.items():
         human_count = sum(1 for p in game.players if not p.is_ai)
@@ -53,6 +163,7 @@ def get_rooms():
 
 @socketio.on('connect')
 def handle_connect():
+    ensure_cleanup_loop()
     print(f"Client connected: {request.sid}")
 
 
@@ -60,21 +171,23 @@ def handle_connect():
 def handle_disconnect():
     print(f"Client disconnected: {request.sid}")
     if request.sid in player_rooms:
-        room_id = player_rooms[request.sid]
+        room_id = player_rooms.pop(request.sid)
         if room_id in rooms:
             game = rooms[room_id]
             player = game.get_player(request.sid)
             if player and not player.is_ai:
                 player.is_ai = True
                 player.ai_level = "medium"
-                player.name = f"{player.name}(AI)"
-                game.add_log(f"{player.name} 断线，由AI接管")
+                if not player.name.endswith('(AI)'):
+                    player.name = f"{player.name}(AI)"
+                game.add_log(f"{player.name} 断线，可重进；暂由AI接管")
                 broadcast_game_state(room_id)
 
 
 @socketio.on('create_room')
 def handle_create_room(data):
-    player_name = data.get('name', '玩家')
+    cleanup_expired_rooms()
+    player_name = (data.get('name') or '').strip() or default_player_name()
     hero_name = data.get('hero', HEROES[0].name)
     room_id = generate_room_id()
     while room_id in rooms:
@@ -82,8 +195,9 @@ def handle_create_room(data):
     game = Game(room_id)
     hero = next((h for h in HEROES if h.name == hero_name), HEROES[0])
     game.add_player(request.sid, player_name, hero, is_ai=False)
+    player = game.get_player(request.sid)
+    bind_player_session(game, player, room_id)
     rooms[room_id] = game
-    player_rooms[request.sid] = room_id
     join_room(room_id)
     emit('room_created', {
         'room_id': room_id,
@@ -95,19 +209,37 @@ def handle_create_room(data):
 
 @socketio.on('join_room')
 def handle_join_room(data):
+    cleanup_expired_rooms()
     room_id = data.get('room_id')
-    player_name = data.get('name', '玩家')
+    player_name = (data.get('name') or '').strip() or default_player_name()
     hero_name = data.get('hero', HEROES[0].name)
     if room_id not in rooms:
         emit('error', {'message': '房间不存在'})
         return
     game = rooms[room_id]
+    fingerprint = get_client_fingerprint()
+    existing = find_player_by_fingerprint(game, fingerprint)
+    if existing:
+        bind_player_session(game, existing, room_id)
+        join_room(room_id)
+        game.add_log(f"{existing.name} 已重连")
+        emit('room_joined', {
+            'room_id': room_id,
+            'player_id': request.sid,
+            'game': game.to_dict(request.sid)
+        })
+        broadcast_game_state(room_id)
+        broadcast_room_list()
+        return
     if game.game_started:
-        emit('error', {'message': '游戏已开始'})
+        emit('error', {'message': '游戏已开始；只有断线玩家可重进'})
         return
     hero = next((h for h in HEROES if h.name == hero_name), HEROES[0])
-    game.add_player(request.sid, player_name, hero, is_ai=False)
-    player_rooms[request.sid] = room_id
+    if not game.add_player(request.sid, player_name, hero, is_ai=False):
+        emit('error', {'message': '房间已满'})
+        return
+    player = game.get_player(request.sid)
+    bind_player_session(game, player, room_id)
     join_room(room_id)
     emit('room_joined', {
         'room_id': room_id,
@@ -158,9 +290,11 @@ def handle_start_game(data):
             ai_id = f"ai_{uuid.uuid4().hex[:8]}"
             game.add_player(ai_id, f"{ai_name}(AI)", hero, is_ai=True, ai_level="medium")
     if game.start_game():
+        touch_room(game)
         broadcast_game_state(room_id)
         broadcast_room_list()
         start_ai_loop(room_id)
+        schedule_current_turn(room_id)
 
 
 @socketio.on('game_action')
@@ -183,7 +317,7 @@ def handle_game_action(data):
         return
     current = game.get_current_player()
     if current and current.is_ai:
-        socketio.start_background_task(run_ai_turn, room_id)
+        schedule_current_turn(room_id)
 
 
 def process_player_action(game: Game, player, action: dict) -> dict:
@@ -216,6 +350,7 @@ def process_player_action(game: Game, player, action: dict) -> dict:
     elif action_type == 'end_discard':
         game.next_turn()
         broadcast_game_state(game.room_id)
+        schedule_current_turn(game.room_id)
         return {"success": True, "message": "回合结束"}
     return {"success": False, "message": "未知操作"}
 
@@ -430,6 +565,7 @@ def _handle_discard_phase(game: Game, player):
     if len(player.hand_cards) <= max_hand:
         game.next_turn()
         broadcast_game_state(game.room_id)
+        schedule_current_turn(game.room_id)
     else:
         if player.is_ai:
             to_discard = len(player.hand_cards) - max_hand
@@ -445,6 +581,7 @@ def _handle_discard_phase(game: Game, player):
             game.add_log(f"{player.name} 弃置了 {to_discard} 张牌")
             game.next_turn()
             broadcast_game_state(game.room_id)
+            schedule_current_turn(game.room_id)
         else:
             game.pending_action = {
                 "type": "discard_phase",
@@ -471,31 +608,21 @@ def handle_discard_cards(data):
             player.hand_cards.remove(card)
             game.discard_pile.append(card)
     game.add_log(f"{player.name} 弃置了 {len(card_ids)} 张牌")
+    game.pending_action = None
     game.next_turn()
     broadcast_game_state(room_id)
-    current = game.get_current_player()
-    if current and current.is_ai:
-        socketio.start_background_task(run_ai_turn, room_id)
+    schedule_current_turn(room_id)
 
 
-def run_ai_turn(room_id: str):
+def run_ai_play_phase(room_id: str):
     if room_id not in rooms:
         return
     game = rooms[room_id]
     current = game.get_current_player()
     if not current or not current.is_ai:
         return
-    game.phase = GamePhase.JUDGE
-    time.sleep(0.5)
-    broadcast_game_state(room_id)
-    game.phase = GamePhase.DRAW
-    if not current.skip_draw:
-        current.draw_cards(game, 2)
-        game.add_log(f"{current.name} 摸了2张牌")
-    current.skip_draw = False
-    time.sleep(0.5)
-    broadcast_game_state(room_id)
-    game.phase = GamePhase.PLAY
+    if game.phase != GamePhase.PLAY:
+        return
     max_actions = 20
     actions_taken = 0
     while actions_taken < max_actions:
@@ -535,8 +662,8 @@ def start_ai_loop(room_id: str):
             if game.phase == GamePhase.GAME_OVER:
                 break
             current = game.get_current_player()
-            if current and current.is_ai and game.phase in [GamePhase.JUDGE, GamePhase.DRAW, GamePhase.PLAY]:
-                run_ai_turn(room_id)
+            if current and current.is_ai and game.phase == GamePhase.PLAY:
+                run_ai_play_phase(room_id)
             time.sleep(1)
     thread = threading.Thread(target=ai_loop, daemon=True)
     thread.start()
@@ -571,7 +698,7 @@ def broadcast_room_list():
             "game_started": game.game_started,
             "players": [{"name": p.name, "hero": p.hero.name, "is_ai": p.is_ai} for p in game.players]
         })
-    socketio.emit('room_list', room_list, broadcast=True)
+    socketio.emit('room_list', room_list)
 
 
 if __name__ == '__main__':

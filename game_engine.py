@@ -4,6 +4,7 @@
 """
 import random
 import copy
+import time
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional
@@ -194,6 +195,8 @@ class Game:
         self.game_started = False
         self.pending_action = None
         self.action_queue: list = []
+        self.created_at = time.time()
+        self.last_active_at = self.created_at
         self._init_deck()
 
     def _init_deck(self):
@@ -332,6 +335,9 @@ class Game:
             "phase": self.phase.value,
             "turn_count": self.turn_count,
             "game_started": self.game_started,
+            "created_at": self.created_at,
+            "last_active_at": self.last_active_at,
+            "expires_in": max(0, int(1800 - (time.time() - self.created_at))),
             "draw_pile_count": len(self.draw_pile),
             "discard_pile_count": len(self.discard_pile),
             "log": self.log[-20:],

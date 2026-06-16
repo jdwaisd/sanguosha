@@ -142,6 +142,11 @@ font-size:14px;color:var(--gold);letter-spacing:2px;
 ::-webkit-scrollbar{width:6px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+.hero-avatar{width:56px;height:56px;border-radius:50%;margin:0 auto 8px;display:flex;align-items:center;justify-content:center;font-size:28px;background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.25),rgba(0,0,0,.25));border:2px solid var(--border);box-shadow:inset 0 0 12px rgba(0,0,0,.35)}
+.player-mini .hero-avatar{width:48px;height:48px;font-size:24px;margin-bottom:6px}.room-expire{color:var(--text-dark);font-size:12px;text-align:center;margin-bottom:8px}.sound-toggle{position:fixed;right:12px;bottom:12px;z-index:1200;border-radius:999px;padding:10px 12px;background:rgba(42,26,10,.92)}
+@media(max-width:768px){body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}.top-bar{position:sticky;top:0;z-index:100;padding:8px 10px;gap:8px;flex-wrap:wrap}.top-bar .logo{font-size:22px;letter-spacing:2px}.top-bar .user-info{display:flex;gap:6px;width:100%}.top-bar input{flex:1;width:auto}.main-container{padding:10px}.panel{padding:12px;margin-bottom:12px}.room-grid{grid-template-columns:1fr}.hero-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-height:none}.other-players{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.player-mini{min-width:0;padding:8px}.game-log{max-height:110px;font-size:12px}.my-hand{position:sticky;bottom:0;background:linear-gradient(180deg,rgba(26,10,0,.2),rgba(26,10,0,.96));z-index:20;overflow-x:auto;flex-wrap:nowrap;justify-content:flex-start;padding:12px 4px}.card-item{min-width:64px;width:64px;height:92px;font-size:10px}.card-item:hover{transform:translateY(-4px)}.action-bar{position:sticky;bottom:116px;background:rgba(26,10,0,.92);z-index:21;padding:8px}.btn{padding:9px 12px}.response-dialog{max-width:92vw;padding:18px}.response-dialog .cards-row{max-height:50vh;overflow:auto}.phase-indicator{position:sticky;top:78px;z-index:50}}
+
 @media(max-width:768px){
 .card-item{width:60px;height:85px;font-size:10px}
 .card-item .card-name{font-size:12px}
@@ -206,6 +211,7 @@ font-size:14px;color:var(--gold);letter-spacing:2px;
 </div>
 <div id="gameView" class="game-container">
 <div class="phase-indicator" id="phaseIndicator">准备中...</div>
+<div class="room-expire" id="roomExpire"></div>
 <div class="other-players" id="otherPlayers"></div>
 <div class="game-log" id="gameLog"></div>
 <div class="my-equipment" id="myEquipment">
@@ -227,19 +233,27 @@ font-size:14px;color:var(--gold);letter-spacing:2px;
 <script>
 const socket=io();
 let myPlayerId=null,currentRoomId=null,gameState=null,selectedHero=null,selectedCardId=null,pendingCardAction=null,heroes=[];
+let soundEnabled=localStorage.getItem('sgsSound')!=='off',lastPhase=null,lastLogLen=0;
+function md5LikeName(){const ua=navigator.userAgent||'ua';let h=0;for(let i=0;i<ua.length;i++){h=((h<<5)-h)+ua.charCodeAt(i);h|=0}return '玩家'+Math.abs(h).toString(16).slice(0,6)}
+document.addEventListener('DOMContentLoaded',()=>{const input=document.getElementById('playerName');if(input&&(!input.value||input.value==='玩家'))input.value=md5LikeName();updateSoundButton()});
+function heroAvatar(name){const map={刘备:'🟢',关羽:'🟩',张飞:'🧔',赵云:'🐉',诸葛亮:'🪶',曹操:'🔵',司马懿:'🦉',夏侯惇:'⚔️',张辽:'🛡️',郭嘉:'📜',孙权:'🔴',周瑜:'🔥',陆逊:'📘',大乔:'🌸',吕布:'🐺',貂蝉:'💃',华佗:'🌿'};return map[name]||'🏯'}
+function playTone(kind='click'){if(!soundEnabled)return;try{const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;const ctx=new AC(),osc=ctx.createOscillator(),gain=ctx.createGain();const freq={start:523,card:659,hit:180,turn:440,win:784,click:330}[kind]||330;osc.frequency.value=freq;osc.type=kind==='hit'?'sawtooth':'sine';gain.gain.setValueAtTime(.0001,ctx.currentTime);gain.gain.exponentialRampToValueAtTime(.12,ctx.currentTime+.02);gain.gain.exponentialRampToValueAtTime(.0001,ctx.currentTime+.18);osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.2)}catch(e){}}
+function toggleSound(){soundEnabled=!soundEnabled;localStorage.setItem('sgsSound',soundEnabled?'on':'off');updateSoundButton();playTone('click')}
+function updateSoundButton(){const b=document.getElementById('soundToggle');if(b)b.textContent=soundEnabled?'🔊 音效':'🔇 静音'}
 socket.on('connect',()=>{refreshRooms()});
 socket.on('room_list',rooms=>renderRoomList(rooms));
 socket.on('room_created',data=>{myPlayerId=data.player_id;currentRoomId=data.room_id;gameState=data.game;showRoomWait()});
 socket.on('room_joined',data=>{myPlayerId=data.player_id;currentRoomId=data.room_id;gameState=data.game;showRoomWait()});
 socket.on('game_state',state=>{gameState=state;if(state.game_started){showGameView();renderGame()}else{renderWaitRoom()}});
 socket.on('error',data=>alert(data.message));
+socket.on('room_closed',data=>{alert(data.message||'房间已关闭');leaveRoom()});
 function showView(id){document.querySelectorAll('#lobbyView,#createRoomView,#roomWaitView,#gameView').forEach(e=>e.classList.add('hidden'));document.getElementById(id).classList.remove('hidden')}
 function backToLobby(){showView('lobbyView');selectedHero=null;refreshRooms()}
 function showCreateRoom(){showView('createRoomView');loadHeroes()}
 function showRoomWait(){showView('roomWaitView');document.getElementById('waitRoomId').textContent=currentRoomId;renderWaitRoom()}
 function showGameView(){showView('gameView');document.getElementById('gameView').classList.add('active')}
 async function loadHeroes(){try{const r=await fetch('/api/heroes');heroes=await r.json();renderHeroGrid()}catch(e){}}
-function renderHeroGrid(){const k={'魏':'#2980b9','蜀':'#27ae60','吴':'#e74c3c','群':'#8e44ad'};document.getElementById('heroSelect').innerHTML=heroes.map(h=>'<div class="hero-card '+(selectedHero===h.name?'selected':'')+'" onclick="selectHero(\''+h.name+'\')"><div class="hero-name">'+h.name+'</div><div class="hero-kingdom" style="color:'+(k[h.kingdom]||'#888')+'">'+h.kingdom+'</div><div class="hero-hp">❤ '+h.max_hp+'</div><div class="hero-skills">'+h.skills.join('<br>')+'</div></div>').join('')}
+function renderHeroGrid(){const k={'魏':'#2980b9','蜀':'#27ae60','吴':'#e74c3c','群':'#8e44ad'};document.getElementById('heroSelect').innerHTML=heroes.map(h=>'<div class="hero-card '+(selectedHero===h.name?'selected':'')+'" onclick="selectHero(\''+h.name+'\')"><div class="hero-avatar">'+heroAvatar(h.name)+'</div><div class="hero-name">'+h.name+'</div><div class="hero-kingdom" style="color:'+(k[h.kingdom]||'#888')+'">'+h.kingdom+'</div><div class="hero-hp">❤ '+h.max_hp+'</div><div class="hero-skills">'+h.skills.join('<br>')+'</div></div>').join('')}
 function selectHero(n){selectedHero=n;renderHeroGrid()}
 function createRoom(){const n=document.getElementById('playerName').value||'玩家';if(!selectedHero){alert('请选择英雄');return};socket.emit('create_room',{name:n,hero:selectedHero})}
 function joinRoom(){const rid=document.getElementById('joinRoomId').value.trim();const n=document.getElementById('playerName').value||'玩家';if(!rid){alert('请输入房间号');return};if(!selectedHero){loadHeroes().then(()=>{if(heroes.length>0)selectedHero=heroes[0].name;socket.emit('join_room',{room_id:rid,name:n,hero:selectedHero||heroes[0]?.name})});return};socket.emit('join_room',{room_id:rid,name:n,hero:selectedHero})}
@@ -248,13 +262,13 @@ function addAI(c){const l=document.getElementById('aiLevel').value;socket.emit('
 function startGame(){socket.emit('start_game',{room_id:currentRoomId})}
 function refreshRooms(){fetch('/api/rooms').then(r=>r.json()).then(rooms=>renderRoomList(rooms))}
 function renderRoomList(rooms){const l=document.getElementById('roomList');if(!rooms||rooms.length===0){l.innerHTML='<div style="color:var(--text-dark);grid-column:1/-1;text-align:center;padding:40px">暂无房间，点击"创建房间"开始游戏</div>';return};l.innerHTML=rooms.map(r=>'<div class="room-card" onclick="document.getElementById(\'joinRoomId\').value=\''+r.room_id+'\';joinRoom()"><div class="room-id">🏠 '+r.room_id+'</div><div class="room-info">'+r.human_count+'人 + '+(r.player_count-r.human_count)+'AI / '+r.max_players+'人</div><div class="player-list">'+r.players.map(p=>'<span class="player-tag '+(p.is_ai?'ai':'')+'">'+p.hero+' '+p.name+'</span>').join('')+'</div><div class="status '+(r.game_started?'playing':'waiting')+'">'+(r.game_started?'🔴 游戏中':'🟢 等待中')+'</div></div>').join('')}
-function renderWaitRoom(){if(!gameState)return;const ps=gameState.players||[];document.getElementById('waitPlayerList').innerHTML=ps.map(p=>'<div class="player-mini"><div class="pname">'+p.name+'</div><div class="phero">'+p.hero.name+' · '+p.hero.kingdom+'</div><div class="pinfo">❤ '+p.max_hp+' '+(p.is_ai?'🤖':'👤')+'</div></div>').join('');document.getElementById('startGameBtn').disabled=ps.length<2}
+function renderWaitRoom(){if(!gameState)return;const ps=gameState.players||[];document.getElementById('waitPlayerList').innerHTML=ps.map(p=>'<div class="player-mini"><div class="hero-avatar">'+heroAvatar(p.hero.name)+'</div><div class="pname">'+p.name+'</div><div class="phero">'+p.hero.name+' · '+p.hero.kingdom+'</div><div class="pinfo">❤ '+p.max_hp+' '+(p.is_ai?'🤖':'👤')+'</div></div>').join('');document.getElementById('startGameBtn').disabled=ps.length<2}
 function renderGame(){
 if(!gameState)return;
 const mp=gameState.my_player,ps=gameState.players||[],cpid=gameState.current_player_id,phase=gameState.phase;
 const pn={waiting:'等待中...',judge:'判定阶段',draw:'摸牌阶段',play:'出牌阶段',discard:'弃牌阶段',game_over:'游戏结束'};
 const cp=ps.find(p=>p.player_id===cpid);
-document.getElementById('phaseIndicator').textContent='回合 '+gameState.turn_count+' · '+(pn[phase]||phase)+' · '+(cp?cp.name:'');
+document.getElementById('phaseIndicator').textContent='回合 '+gameState.turn_count+' · '+(pn[phase]||phase)+' · '+(cp?cp.name:'');const exp=document.getElementById('roomExpire');if(exp&&gameState.expires_in!==undefined){const m=Math.floor(gameState.expires_in/60),sec=gameState.expires_in%60;exp.textContent='房间约 '+m+'分'+String(sec).padStart(2,'0')+'秒后自动解散'}if(lastPhase&&lastPhase!==phase)playTone(phase==='game_over'?'win':phase==='play'?'turn':'click');lastPhase=phase;
 const od=document.getElementById('otherPlayers');
 const ops=ps.filter(p=>p.player_id!==myPlayerId);
 od.innerHTML=ops.map(p=>'<div class="player-mini '+(p.player_id===cpid?'current':'')+' '+(p.is_alive?'':'dead')+'" onclick="'+(phase==='play'&&myPlayerId===cpid&&p.is_alive?'selectTarget(\''+p.player_id+'\')':'')+'"><div class="pname">'+p.name+' '+(p.is_ai?'🤖':'')+'</div><div class="phero">'+p.hero.name+' · '+p.hero.kingdom+'</div><div class="php">'+'❤'.repeat(p.hp)+'🖤'.repeat(p.max_hp-p.hp)+'</div><div class="pinfo">手牌: '+p.hand_count+' | 装备: '+Object.values(p.equipment).filter(e=>e).length+'</div></div>').join('');
@@ -270,7 +284,7 @@ else if(imt){ab.innerHTML='<button class="btn btn-success" onclick="useSelectedC
 else if(imd){const p=gameState.pending_action;if(p&&p.type==='discard_phase'){ab.innerHTML='<span style="color:var(--gold)">请弃置 '+p.to_discard+' 张牌（点击卡牌选中，然后确认）</span><button class="btn btn-danger" onclick="confirmDiscard()">确认弃牌</button>'}}
 else{ab.innerHTML='<span style="color:var(--text-dark)">等待其他玩家行动...</span>'}
 const ld=document.getElementById('gameLog');
-if(gameState.log){ld.innerHTML=gameState.log.slice(-15).map(l=>'<div class="log-entry">'+l+'</div>').join('');ld.scrollTop=ld.scrollHeight}
+if(gameState.log){if(gameState.log.length>lastLogLen)playTone('card');lastLogLen=gameState.log.length;ld.innerHTML=gameState.log.slice(-15).map(l=>'<div class="log-entry">'+l+'</div>').join('');ld.scrollTop=ld.scrollHeight}
 handlePendingAction()
 }
 function handlePendingAction(){
@@ -283,8 +297,8 @@ else if(p.type==='discard_card'&&p.target_id===myPlayerId){ov.classList.remove('
 else if(p.type==='shunshou_card'&&p.target_id===myPlayerId){ov.classList.remove('hidden');dg.innerHTML='<h3>🃏 顺手牵羊 - 对方将获得你一张手牌</h3><div class="cards-row">'+(mp.hand_cards||[]).map(c=>'<div class="card-item" onclick="shunshouCard('+c.id+')"><div class="card-suit">'+c.suit+c.number+'</div><div class="card-name">'+c.name+'</div></div>').join('')+'</div>'}
 else{ov.classList.add('hidden')}
 }
-function selectCard(cid){selectedCardId=selectedCardId===cid?null:cid;renderGame()}
-function useSelectedCard(){if(!selectedCardId){alert('请先选择一张卡牌');return};pendingCardAction='use';showTargetSelect()}
+function selectCard(cid){selectedCardId=selectedCardId===cid?null:cid;playTone('click');renderGame()}
+function useSelectedCard(){if(!selectedCardId){alert('请先选择一张卡牌');return};playTone('card');pendingCardAction='use';showTargetSelect()}
 function equipSelectedCard(){if(!selectedCardId){alert('请先选择一张卡牌');return};socket.emit('game_action',{room_id:currentRoomId,action:{type:'use_card',card_id:selectedCardId,target_id:null}});selectedCardId=null}
 function showTargetSelect(){document.getElementById('targetSelect').classList.remove('hidden');const ps=gameState.players.filter(p=>p.player_id!==myPlayerId&&p.is_alive);document.getElementById('targetPlayers').innerHTML=ps.map(p=>'<div class="player-mini" onclick="confirmTarget(\''+p.player_id+'\')"><div class="pname">'+p.name+'</div><div class="phero">'+p.hero.name+'</div><div class="php">'+'❤'.repeat(p.hp)+'</div></div>').join('')}
 function selectTarget(pid){if(pendingCardAction==='use')confirmTarget(pid)}
@@ -298,5 +312,6 @@ function discardOneCard(cid){socket.emit('discard_cards',{room_id:currentRoomId,
 function shunshouCard(cid){socket.emit('discard_cards',{room_id:currentRoomId,card_ids:[cid]});document.getElementById('responseOverlay').classList.add('hidden')}
 refreshRooms();
 </script>
+<button class="btn sound-toggle" id="soundToggle" onclick="toggleSound()">🔊 音效</button>
 </body>
 </html>
