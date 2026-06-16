@@ -9,7 +9,9 @@ import time
 import threading
 import os
 import hashlib
-from flask import Flask, render_template, request, jsonify, session
+import urllib.request
+import urllib.error
+from flask import Flask, render_template, request, jsonify, session, send_from_directory, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from game_engine import Game, Hero, HEROES, AIPlayer, CardType, CardCategory, GamePhase
 
@@ -132,6 +134,45 @@ def advance_to_play_phase(room_id: str):
 def schedule_current_turn(room_id: str):
     if room_id in rooms and rooms[room_id].phase != GamePhase.GAME_OVER:
         socketio.start_background_task(advance_to_play_phase, room_id)
+
+
+
+
+HERMES_DIST = os.getenv('HERMES_DIST', '/root/.openclaw/workspace/hermes_agent/frontend/dist')
+HERMES_BACKEND = os.getenv('HERMES_BACKEND', 'http://127.0.0.1:5000')
+
+
+@app.route('/hermes/')
+def hermes_index():
+    return send_from_directory(HERMES_DIST, 'index.html')
+
+
+@app.route('/hermes/<path:path>')
+def hermes_static(path):
+    target = os.path.join(HERMES_DIST, path)
+    if os.path.exists(target) and os.path.isfile(target):
+        return send_from_directory(HERMES_DIST, path)
+    return send_from_directory(HERMES_DIST, 'index.html')
+
+
+@app.route('/hermes/api/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+def hermes_api_proxy(path):
+    query = request.query_string.decode('utf-8')
+    url = f"{HERMES_BACKEND}/api/{path}" + (f"?{query}" if query else '')
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in {'host', 'content-length', 'connection', 'accept-encoding'}}
+    data = request.get_data() if request.method not in {'GET', 'HEAD'} else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=request.method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read()
+            excluded = {'transfer-encoding', 'connection', 'content-encoding'}
+            response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+            return Response(body, status=resp.status, headers=response_headers)
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return Response(body, status=e.code, content_type=e.headers.get('Content-Type', 'application/json'))
+    except Exception as e:
+        return jsonify({'error': 'Hermes backend unavailable', 'detail': str(e)}), 502
 
 
 @app.route('/')
