@@ -140,6 +140,53 @@ def schedule_current_turn(room_id: str):
 
 HERMES_DIST = os.getenv('HERMES_DIST', '/root/.openclaw/workspace/hermes_agent/frontend/dist')
 HERMES_BACKEND = os.getenv('HERMES_BACKEND', 'http://127.0.0.1:5000')
+ECOMMERCE_BACKEND = os.getenv('ECOMMERCE_BACKEND', 'http://127.0.0.1:8001')
+
+
+def proxy_http(base_url: str, path: str, strip_prefix: str = ''):
+    query = request.query_string.decode('utf-8')
+    url = f"{base_url}/{path.lstrip('/')}" + (f"?{query}" if query else '')
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in {'host', 'content-length', 'connection', 'accept-encoding'}}
+    data = request.get_data() if request.method not in {'GET', 'HEAD'} else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=request.method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            content_type = resp.headers.get('Content-Type', '')
+            if strip_prefix and 'text/html' in content_type:
+                text = body.decode('utf-8', 'replace')
+                # Rewrite root-relative app links so the Flask app can live under a public subpath.
+                for attr in ['href', 'src', 'action']:
+                    text = text.replace(f'{attr}="/', f'{attr}="{strip_prefix}/')
+                    text = text.replace(f"{attr}='/", f"{attr}='{strip_prefix}/")
+                text = text.replace("location.href='/", f"location.href='{strip_prefix}/")
+                text = text.replace("apiPost('/", f"apiPost('{strip_prefix}/")
+                body = text.encode('utf-8')
+            excluded = {'transfer-encoding', 'connection', 'content-encoding', 'content-length'}
+            response_headers = []
+            for k, v in resp.headers.items():
+                lk = k.lower()
+                if lk in excluded:
+                    continue
+                if strip_prefix and lk == 'location' and v.startswith('/') and not v.startswith(strip_prefix + '/'):
+                    v = strip_prefix + v
+                response_headers.append((k, v))
+            return Response(body, status=resp.status, headers=response_headers)
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return Response(body, status=e.code, content_type=e.headers.get('Content-Type', 'application/json'))
+    except Exception as e:
+        return jsonify({'error': 'Backend unavailable', 'detail': str(e)}), 502
+
+
+@app.route('/ecommerce/')
+def ecommerce_index():
+    return proxy_http(ECOMMERCE_BACKEND, '/', '/ecommerce')
+
+
+@app.route('/ecommerce/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+def ecommerce_proxy(path):
+    return proxy_http(ECOMMERCE_BACKEND, path, '/ecommerce')
 
 
 @app.route('/hermes/')
