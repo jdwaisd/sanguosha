@@ -1,5 +1,7 @@
-__pycache__/
-*.pyc
-*.pyo
-.env
+.venv/
+.bootstrap/
+.pydeps/
+*.pid
 *.log
+__pycache__/
+*.py[cod]

@@ -7,12 +7,13 @@ import uuid
 import random
 import time
 import threading
+import os
 from flask import Flask, render_template, request, jsonify, session
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from game_engine import Game, Hero, HEROES, AIPlayer, CardType, CardCategory, GamePhase
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'sanguosha-secret-key-2024'
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'sanguosha-dev-secret-change-me')
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 rooms: dict[str, Game] = {}
@@ -574,4 +575,4 @@ def broadcast_room_list():
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=int(os.getenv('PORT', '8000')), debug=os.getenv('FLASK_DEBUG', '0') == '1', allow_unsafe_werkzeug=True)
