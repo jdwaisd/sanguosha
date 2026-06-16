@@ -679,11 +679,13 @@ def broadcast_game_state(room_id: str):
     if room_id not in rooms:
         return
     game = rooms[room_id]
+    # Public state first, then per-player private state. This prevents the
+    # hidden-hand public payload from overwriting the current player's hand UI.
+    socketio.emit('game_state', game.to_dict(), room=room_id)
     for player in game.players:
         if not player.is_ai:
             state = game.to_dict(player.player_id)
             socketio.emit('game_state', state, room=player.player_id)
-    socketio.emit('game_state', game.to_dict(), room=room_id)
 
 
 def broadcast_room_list():
